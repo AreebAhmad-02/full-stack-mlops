@@ -1,141 +1,169 @@
+"""Train and tune churn classifiers with a grid search.
+
+The input DataFrame is already preprocessed (see preprocess.py). It is split
+again here into a fitting part and a validation part, used to pick the best
+hyperparameters; the final held-out test split never reaches this module.
+"""
+
 import pandas as pd
 import xgboost as xgb
+from predict import print_results
 from sklearn.ensemble import RandomForestClassifier
 from sklearn.metrics import accuracy_score, balanced_accuracy_score
-from sklearn.model_selection import train_test_split, GridSearchCV
+from sklearn.model_selection import GridSearchCV, train_test_split
 from sklearn.tree import DecisionTreeClassifier
 
-from predict import print_results
+from settings import DEBUG, RANDOM_STATE, TARGET  # isort:skip
 
-from settings import DEBUG, TARGET # isort:skip
-DEBUG = True # True # False # override global settings
+# Hyperparameter grids searched for each supported classifier.
+PARAM_GRIDS = {
+    'XGBClassifier': {
+        'eta': [0.01, 0.1, 0.15, 0.2, 0.25, 0.3, 0.4],  # learning rate
+        'gamma': [0, 1, 2, 3],  # minimum loss reduction to split; larger is more conservative
+        'max_depth': [2, 3, 4, 5, 6],
+        'min_child_weight': [0, 1, 2],
+        'max_delta_step': [0, 1, 2, 4],
+        'lambda': [0, 1, 2],  # L2 regularisation on leaf weights
+    },
+    'DecisionTreeClassifier': {
+        'max_depth': [3, 5, 7, 10, 20, 30, None],
+        'min_samples_leaf': [1, 3, 5],
+        'min_samples_split': [2, 6, 10],
+    },
+    'RandomForestClassifier': {
+        'n_estimators': [25, 50, 100, 150, 200],
+        'max_features': ['sqrt', 'log2', None],
+        'max_depth': [3, 6, 9, None],
+        'min_samples_leaf': [1, 3, 5],
+        'min_samples_split': [2, 6, 10],
+        'max_leaf_nodes': [3, 6, 9],
+    },
+}
+
+
+def make_classifier(name, random_state=RANDOM_STATE):
+    """Create an untrained classifier by name; raise ValueError for unknown names."""
+    if name == 'XGBClassifier':
+        return xgb.XGBClassifier(booster='gbtree', random_state=random_state)
+    if name == 'DecisionTreeClassifier':
+        return DecisionTreeClassifier(random_state=random_state)
+    if name == 'RandomForestClassifier':
+        return RandomForestClassifier(random_state=random_state)
+    raise ValueError(f'Unknown classifier: {name}')
+
 
 def prepare_training(df, params):
-    # dataset in df is already preprocessed - cleaned, OrdinalEncoder applied
-    # determine test_size
+    """Split a preprocessed DataFrame into features and labels for training.
+
+    Args:
+        df: preprocessed DataFrame including the TARGET column.
+        params: dict with 'test_size' (default 0.2), 'random_state' (default 42)
+            and 'balance'. With balance=True, the larger class is cut down so
+            both classes have the same number of rows (churners are roughly
+            one in four customers, so the raw data is imbalanced).
+
+    Returns:
+        (X_train, X_test, y_train, y_test, params); with balance=True, params
+        also gets 'min_subset', the number of rows kept per class.
+    """
     test_size = params.get('test_size', 0.2)
-    train_size = 1 - test_size
-    # target labels column
-    target = TARGET
-    cols = df.columns.to_list()
+    random_state = params.get('random_state', RANDOM_STATE)
 
-    random_state = params.get('random_state', 42)
-    if params.get('balance', False): # balance dataset on target labels?
-        print(f'\nBalancing dataset...')
-        # as Churn 0 / 1 are unbalanced (~ 3:1 or more), let's mix a good proportion manually
-        dataset0 = list(df[df[target]==0].sample(frac=1, random_state=random_state).itertuples(index=False, name=None))
-        dataset1 = list(df[df[target]==1].sample(frac=1, random_state=random_state).itertuples(index=False, name=None))
+    if not params.get('balance', False):
+        X = df.drop(columns=[TARGET])
+        X_train, X_test, y_train, y_test = train_test_split(
+            X, df[TARGET], test_size=test_size, random_state=random_state
+        )
+        return X_train, X_test, y_train, y_test, params
 
-        # minimal subset to have equal number of target labels
-        min_len = min(len(dataset0), len(dataset1))
-        params['min_subset'] = min_len
-        train_data = dataset0[:int(min_len*train_size)] + dataset1[:int(min_len*train_size)]
-        test_data = dataset0[int(min_len*train_size):int(min_len*1.00)+1] + dataset1[int(min_len*train_size):int(min_len*1.00)+1]
+    print('\nBalancing dataset...')
+    class0 = df[df[TARGET] == 0].sample(frac=1, random_state=random_state)
+    class1 = df[df[TARGET] == 1].sample(frac=1, random_state=random_state)
+    min_len = min(len(class0), len(class1))
+    params['min_subset'] = min_len
 
-        X_train = pd.DataFrame(train_data, columns=cols)
-        X_test = pd.DataFrame(test_data, columns=cols)
-        y_train = X_train.pop(target)
-        y_test = X_test.pop(target)
-        if DEBUG:
-            print(' by', df[target].value_counts().to_string())
-            print(f"\nTotal: {df.shape[0]} // Min subset: {min_len} // Split: train {len(train_data)} + test {len(test_data)}")
-            print(f"\nX_train: {X_train.shape[0]}\n{X_train.head()}\n\n")
-            print(' by', y_train.value_counts().to_string())
-    else:
-        cols.remove(target)
-        X_train, X_test, y_train, y_test = train_test_split(df[cols], df[target], test_size=test_size, random_state=random_state)
-    return X_train, X_test, y_train, y_test, params
+    n_train = int(min_len * (1 - test_size))
+    train = pd.concat([class0[:n_train], class1[:n_train]])
+    test = pd.concat([class0[n_train:min_len], class1[n_train:min_len]])
+    y_train = train.pop(TARGET)
+    y_test = test.pop(TARGET)
+
+    if DEBUG:
+        print(' by', df[TARGET].value_counts().to_string())
+        print(f'Total: {len(df)}, per class: {min_len}, train {len(train)}, test {len(test)}')
+    return train, test, y_train, y_test, params
 
 
-def train_model(df, params, random_state=42):
+def train_model(df, params, random_state=RANDOM_STATE):
+    """Tune one classifier with a grid search and score it on a validation split.
 
-        X_train, X_test, y_train, y_test, _ = prepare_training(df,
-                                                        {'balance': params['balance'],
-                                                            'test_size': params['test_size'],
-                                                            'random_state': random_state
-                                                        })
-        classifier_name = params['classifier']
-        print(f"\nGridSearchCV {classifier_name}...")
-        # Define the parameter grid to tune the hyperparameters (for gbtree)
-        if classifier_name=='XGBClassifier':
-            param_grid = {
-                'eta': [0.01, 0.1, 0.15, 0.2, 0.25, 0.3, 0,4],  # ~ learning_rate
-                'gamma': [0, 1, 2, 3], # min_split_loss The larger gamma is, the more conservative the algorithm will be
-                'max_depth': [2, 3, 4, 5, 6],
-                'min_child_weight': [0, 1, 2],
-                'max_delta_step': [0, 1, 2, 4],
-                'lambda': [0, 1, 2], # reg_lambda L2 regularization term on weights (analogous to Ridge regression)
-            }
-            classifier = xgb.XGBClassifier(booster='gbtree', random_state=random_state)
-        elif classifier_name=='DecisionTreeClassifier':
-            param_grid = {
-                'max_depth': [3, 5, 7, 10, 20, 30, None],
-                'min_samples_leaf': [1, 3, 5],
-                'min_samples_split': [2, 6, 10],
-            }
-            classifier = DecisionTreeClassifier(random_state=random_state) # DecisionTreeRegressor(random_state=random_state) # Initialize a decision tree regressor
-        elif classifier_name=='RandomForestClassifier':
-            param_grid = {
-                'n_estimators': [25, 50, 100, 150, 200],
-                'max_features': ['sqrt', 'log2', None],
-                'max_depth': [3, 6, 9, None],
-                'min_samples_leaf': [1, 3, 5],
-                'min_samples_split': [2, 6, 10],
-                'max_leaf_nodes': [3, 6, 9],
-            }
-            classifier = RandomForestClassifier(random_state=random_state)
-        else:
-            return
+    Args:
+        df: preprocessed training DataFrame including the TARGET column.
+        params: dict with 'classifier' (a key of PARAM_GRIDS), 'estimator'
+            (the scikit-learn scoring name to optimise, e.g. 'balanced_accuracy'),
+            'cv' (cross-validation folds), 'test_size' and 'balance'.
+        random_state: seed for the split and the classifier.
 
-        grid_search = GridSearchCV(estimator=classifier, param_grid=param_grid,
-                                   cv=params['cv'],
-                                   n_jobs=-1,
-                                   verbose=1, #3, #2,
-                                   scoring=params['estimator'] #'balanced_accuracy', #'accuracy' #'neg_mean_squared_error'
-                                   )
-        grid_search.fit(X_train, y_train)
-        best_classifier = grid_search.best_estimator_ # Get the best estimator from the grid search
-        best_params = grid_search.best_params_
-        best_score = grid_search.best_score_
-        print(f'\nHPO grid search: {grid_search.scorer_}, {grid_search.n_splits_} splits')
-        print(f"Best parameters: {best_params}")
-        if DEBUG:
-            print(f" best_score_: {best_score}")
-            features_ = list(df.columns)
-            features_.remove(TARGET)
-            # print(f" feature_importances_: {grid_search.best_estimator_.feature_importances_}")
-            # print(f" features_: {features_}")
-            feature_importances_ = dict(zip(features_, list(grid_search.best_estimator_.feature_importances_)))
-            print(classifier_name, 'feature_importances_', sorted(feature_importances_.items(), key=lambda x:x[1], reverse=True))
-            # print(f" cv_results_: {grid_search.cv_results_}") # huge set of data
+    Returns:
+        (best_classifier, best_params, validation accuracy, validation balanced accuracy).
+    """
+    X_train, X_val, y_train, y_val, _ = prepare_training(
+        df,
+        {
+            'balance': params['balance'],
+            'test_size': params['test_size'],
+            'random_state': random_state,
+        },
+    )
+    classifier_name = params['classifier']
+    if classifier_name not in PARAM_GRIDS:
+        raise ValueError(f'Unknown classifier: {classifier_name}')
 
-        # calculating test prediction metrics
-        y_pred = best_classifier.predict(X_test)
-        print_results(f"{classifier_name}, optimized for {params['estimator']}", y_test, y_pred, verbose=True)
-        key_metric1 = accuracy_score(y_test, y_pred)
-        key_metric2 = balanced_accuracy_score(y_test, y_pred)
+    print(f'\nGridSearchCV {classifier_name}...')
+    grid_search = GridSearchCV(
+        estimator=make_classifier(classifier_name, random_state),
+        param_grid=PARAM_GRIDS[classifier_name],
+        cv=params['cv'],
+        n_jobs=-1,
+        verbose=1,
+        scoring=params['estimator'],
+    )
+    grid_search.fit(X_train, y_train)
+    best_classifier = grid_search.best_estimator_
+    print(f'Best parameters: {grid_search.best_params_}')
 
-        return best_classifier, best_params, key_metric1, key_metric2
+    if DEBUG:
+        print(f' best cross-validation score: {grid_search.best_score_}')
+        importances = dict(zip(X_train.columns, best_classifier.feature_importances_, strict=True))
+        ranked = sorted(importances.items(), key=lambda item: item[1], reverse=True)
+        print(classifier_name, 'feature importances:', ranked)
+
+    y_pred = best_classifier.predict(X_val)
+    print_results(f"{classifier_name}, optimised for {params['estimator']}", y_val, y_pred)
+    return (
+        best_classifier,
+        grid_search.best_params_,
+        accuracy_score(y_val, y_pred),
+        balanced_accuracy_score(y_val, y_pred),
+    )
 
 
 if __name__ == '__main__':
-    # to test model training without orchestration and HPO
+    # Train one model without MLflow or Prefect, to check the training code alone.
     from time import time
 
-    from preprocess import load_data
-    df = load_data()
-    estimator = 'accuracy'
-    for classifier in [
-                    'DecisionTreeClassifier',
-                    # 'RandomForestClassifier',
-                    # 'XGBClassifier',
-                    ]:
-        t_start = time()
-        params = {'classifier': classifier,
-                    'estimator': estimator,
-                    'cv': 2,
-                    'test_size': 0.2,
-                    'balance': False,
-                    }
-        best_classifier, best_params, key_metric1, key_metric2 = train_model(df, params, random_state=42)
-        print(f' Finished in {(time() - t_start):.3f} second(s)\n')
+    from preprocess import load_split_data
+
+    train_df, _ = load_split_data()
+    start = time()
+    train_model(
+        train_df,
+        {
+            'classifier': 'DecisionTreeClassifier',
+            'estimator': 'accuracy',
+            'cv': 2,
+            'test_size': 0.2,
+            'balance': False,
+        },
+    )
+    print(f' Finished in {time() - start:.3f} second(s)\n')

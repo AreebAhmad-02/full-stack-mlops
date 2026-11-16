@@ -1,3 +1,13 @@
+"""Data-drift demo with whylogs.
+
+Compares requests recorded by the web service (in MongoDB) with a sample of
+the original dataset, then mutates a low-importance feature (Gender) to show
+that feature drift is detected while the predictions do not drift. Writes
+HTML reports to the current folder.
+
+Run it while the web service and MongoDB containers are up.
+"""
+
 import numpy as np
 import pandas as pd
 
@@ -8,9 +18,7 @@ from preprocess import load_data, enc_load, preprocess_data, model_dir
 from pymongo import MongoClient
 from sklearn.preprocessing import OrdinalEncoder
 
-from settings import DEBUG, DATA_DIR, DATASET_NUM, MODEL_DIR, TARGET  # isort:skip
-
-DEBUG = True  # True # False # override global settings
+from settings import DEBUG, DATASET_NUM, MODEL_DIR, TARGET  # isort:skip
 
 # MONGODB_ADDRESS = 'mongodb://mongo:27017' #127.0.0.1
 MONGODB_ADDRESS = 'mongodb://172.27.0.3:27017'
@@ -149,7 +157,7 @@ print('\nDrift scores1:', drift_scores1)
 # visualizations
 import os
 
-DATA_DIR = os.getcwd() + '/'
+OUTPUT_DIR = os.getcwd() + '/'
 
 from whylogs.viz import NotebookProfileVisualizer
 
@@ -160,22 +168,22 @@ visualization.set_profiles(
 
 visualization.write(
     rendered_html=visualization.profile_summary(),
-    html_file_name=DATA_DIR + "example1",
+    html_file_name=OUTPUT_DIR + "example1",
 )
 
 visualization.write(
     rendered_html=visualization.summary_drift_report(),
-    html_file_name=DATA_DIR + "example2",
+    html_file_name=OUTPUT_DIR + "example2",
 )
 
 visualization.write(
     rendered_html=visualization.double_histogram(
         feature_name=["CashbackAmount", "SatisfactionScore"]
     ),
-    html_file_name=DATA_DIR + "example3",
+    html_file_name=OUTPUT_DIR + "example3",
 )
 
 visualization.write(
     rendered_html=visualization.difference_distribution_chart(feature_name="prediction"),
-    html_file_name=DATA_DIR + "example4",
+    html_file_name=OUTPUT_DIR + "example4",
 )

@@ -1,6 +1,9 @@
+"""Make churn predictions with a saved model and report classification metrics."""
+
 import pickle
 
 import pandas as pd
+from preprocess import enc_load, load_split_data, model_dir, preprocess_data
 from sklearn.metrics import (
     accuracy_score,
     balanced_accuracy_score,
@@ -8,93 +11,82 @@ from sklearn.metrics import (
     confusion_matrix,
 )
 
-from preprocess import enc_load, preprocess_data, model_dir
-from settings import DATA_DIR, DATASET_NUM, MODEL_DIR, TARGET
-
-from settings import DEBUG  # isort:skip
-
-# DEBUG = True # True # False # override global settings
-
-from utils import S3_ENDPOINT_URL, S3_BUCKET  # isort:skip
+from settings import DATASET_NUM, DEBUG, MODEL_DIR, TARGET  # isort:skip
 
 
-def print_results(classifier, y_test, predict_y, verbose=DEBUG):
+def print_results(classifier, y_test, y_pred, verbose=DEBUG):
+    """Print accuracy and balanced accuracy; with verbose, also the full report."""
     print(f'\n================\n{classifier}')
     if verbose:
-        print(classification_report(y_test, predict_y, digits=3))
-        print(confusion_matrix(y_test, predict_y))
-    print(f' accuracy: {accuracy_score(y_test, predict_y):05.3f}')
-    print(f' balanced accuracy: {balanced_accuracy_score(y_test, predict_y):05.3f}')
+        print(classification_report(y_test, y_pred, digits=3))
+        print(confusion_matrix(y_test, y_pred))
+    print(f' accuracy: {accuracy_score(y_test, y_pred):05.3f}')
+    print(f' balanced accuracy: {balanced_accuracy_score(y_test, y_pred):05.3f}')
 
 
-def predict_df(df, MODEL_DIR, verbose=DEBUG):
-    print(f'\nPredicting using model {MODEL_DIR}')
+def load_model(model_path):
+    """Load the pickled model (a fitted GridSearchCV) from a model folder."""
+    with open(f'{model_path}model.pkl', 'rb') as f:
+        return pickle.load(f)
+
+
+def predict_df(df, model_path, verbose=DEBUG):
+    """Predict churn (0 or 1) for every row of a preprocessed DataFrame.
+
+    Args:
+        df: preprocessed DataFrame (see preprocess.preprocess_data). A TARGET
+            column, if present, is ignored for prediction.
+        model_path: folder containing model.pkl, ending with '/'.
+        verbose: print the first predictions.
+
+    Returns:
+        Array of predicted labels, or an empty Series if the model cannot be
+        loaded or fails to predict.
+    """
+    print(f'\nPredicting using model {model_path}')
+    X = df.drop(columns=[TARGET], errors='ignore')
 
     try:
-        test_data = preprocess_data(df)
-    except:
-        test_data = df
-
-    cols = test_data.columns.to_list()
-    X_test = pd.DataFrame(test_data, columns=cols)
-    if TARGET in cols:
-        y_test = X_test.pop(TARGET)
-    else:
-        y_test = pd.Series()
+        model = load_model(model_path)
+    except (OSError, pickle.UnpicklingError) as e:
+        print('!!! Could not load model:', e)
+        return pd.Series(dtype=int)
 
     try:
-        model = pickle.load(open(f'{MODEL_DIR}model.pkl', 'rb'))
-        # print('model.get_params:', model.get_params())
-    except Exception as e:
-        print('!!! Exception while loading model:', e)
-        return pd.Series()
+        # Put the columns in the order the model was trained with.
+        if hasattr(model, 'feature_names_in_'):
+            X = X[list(model.feature_names_in_)]
+        y_pred = model.predict(X)
+    except (KeyError, ValueError) as e:  # e.g. a column missing from the input
+        print(f'!!! Prediction of {TARGET} failed:', e)
+        return pd.Series(dtype=int)
 
-    try:
-        y_pred = model.predict(X_test)
-        if verbose:
-            estimator = type(model.get_params().get('estimator', ''))
-            print(f"\nPrediction:\n{estimator}\ny_pred: {list(y_pred)[:10]}")
-            if len(y_test):
-                print(f"y_test: {list(y_test)[:10]}")
-        return y_pred
-    except Exception as e:
-        print(f'!!! Exception while predicting {TARGET}:', e)
-        return pd.Series()
+    if verbose:
+        print(f'y_pred: {list(y_pred)[:10]}')
+        if TARGET in df.columns:
+            print(f'y_true: {list(df[TARGET])[:10]}')
+    return y_pred
 
 
-def predict_dict(object, dataset_num, verbose=False):
-    # transform dict to create df from it
-    dct = {k: [v] for k, v in object.items()}
-    df = pd.DataFrame(dct)
+def predict_dict(record, dataset_num, verbose=False):
+    """Predict churn for a single customer sent as a dict of raw field values.
+
+    Returns:
+        {'churn': 0 or 1}.
+    """
+    df = pd.DataFrame({key: [value] for key, value in record.items()})
     ord_enc = enc_load(f'{model_dir(dataset_num)}encoder.pkl')
     df = preprocess_data(df, ord_enc, dataset_num, fit_enc=False)
-    # model_dir = f'./model/{dataset_num}/'
     y_pred = predict_df(df, model_dir(dataset_num), verbose=verbose)
-    result = {
-        str(TARGET).lower(): int(list(y_pred)[0])
-    }  # explicit int() is reqiered for serialization
+    result = {TARGET.lower(): int(y_pred[0])}  # int() makes it JSON-serialisable
     if DEBUG:
         print('result:', result)
-
     return result
 
 
 if __name__ == '__main__':
-    # quick tests
-    print('\nTesting predict_df...')
-    from preprocess import load_data
-
-    df = load_data(DATASET_NUM).head(10)
-    y_pred = predict_df(df, MODEL_DIR, verbose=True)
-
-    columns = df.columns.to_list()
-    if TARGET in columns:
-        print_results('Saved model', df[TARGET], y_pred, verbose=True)
-
-    print('\nTesting predict_dict...')
-    # test predict_dict .drop([TARGET], axis=1)
-    row = df.head(1).to_dict('records')[0]
-    print(row)
-    expected_result = row.pop(TARGET, None)
-    result = predict_dict(row, DATASET_NUM, verbose=True)
-    print(f'\npredict_dict: data {row} -> {result} // expected: {expected_result}')
+    # Quick manual check on the held-out test split.
+    _, test_df = load_split_data(DATASET_NUM)
+    sample = test_df.head(10)
+    predictions = predict_df(sample, MODEL_DIR, verbose=True)
+    print_results('Saved model', sample[TARGET], predictions, verbose=True)
